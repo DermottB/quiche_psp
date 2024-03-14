@@ -1,13 +1,14 @@
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <quiche.h>
 #include <netinet/in.h>
 #include <netinet/udp.h>
 #include <openssl/aes.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
 
 ssize_t quiche_encrypt_psp(uint8_t *buf, struct sockaddr_in socket, uint16_t src_port, uint32_t spi){
     struct udphdr inner_header;
@@ -64,9 +65,13 @@ ssize_t quiche_encrypt_psp(uint8_t *buf, struct sockaddr_in socket, uint16_t src
 
     struct psptrail trailer;
 
-    unsigned char psp_packet[sizeof(payload) + sizeof(struct psphdr)];
+    unsigned char *psp_packet[sizeof(payload) + sizeof(struct psphdr) + sizeof(struct psptrail)];
     memcpy(psp_packet, &header, sizeof(header));
-    memcpy(psp_packet, payload, sizeof(payload));
+    memcpy(psp_packet + sizeof(header), payload, sizeof(payload));
+
+    trailer.checksum = SHA256(psp_packet, sizeof(psp_packet), NULL);
+
+    memcpy(psp_packet + sizeof(header) + sizeof(payload), &trailer, sizeof(trailer));
 
 
 }

@@ -1,5 +1,9 @@
 {
     "files.associations": {
-        "socket.h": "c"
+        "socket.h": "c",
+        "evp.h": "c",
+        "types.h": "c",
+        "e_os2.h": "c",
+        "inttypes.h": "c"
     }
 }
