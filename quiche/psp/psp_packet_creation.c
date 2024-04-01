@@ -10,30 +10,24 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 
-ssize_t quiche_encrypt_psp(uint8_t *buf, struct sockaddr_in socket, uint16_t src_port, uint32_t spi){
+//TODO: Add database for SPIs and keys
+//TODO: Add function to generate SPIs
+//TODO: Add connection to database to record PSP packets
+//TODO: Add comments
+
+ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket, uint16_t src_port, uint32_t spi){
     struct udphdr inner_header;
     inner_header.uh_dport = socket.sin_port;
     inner_header.uh_sport = htons(src_port);
-    inner_header.uh_ulen = sizeof(inner_header) + sizeof(buf);
+    inner_header.uh_ulen = sizeof(inner_header) + sizeof(src);
 
 
-    unsigned char combined[sizeof(inner_header) + sizeof(buf)];
+    unsigned char combined[sizeof(inner_header) + sizeof(src)];
     memcpy(combined, &inner_header, sizeof(inner_header));
-    memcpy(combined + sizeof(inner_header), buf, sizeof(buf));
+    memcpy(combined + sizeof(inner_header), src, sizeof(src));
 
 
     AES_KEY key[32];
-
-    bool key_in = false;
-
-    for (size_t i = 0; i < sizeof(key_pairs); i++)
-    {
-        if (spi == key_pairs[i].stream_id){
-            memcpy(key, key_pairs[i].key, 32);
-            key_in = true;
-            break;
-        }
-    }
 
     unsigned char payload[sizeof(combined)];
 
@@ -66,22 +60,54 @@ ssize_t quiche_encrypt_psp(uint8_t *buf, struct sockaddr_in socket, uint16_t src
     struct psptrail trailer;
 
     unsigned char *psp_packet[sizeof(payload) + sizeof(struct psphdr) + sizeof(struct psptrail)];
+    memcpy(dst, &header, sizeof(header));
+    memcpy(dst + sizeof(header), payload, sizeof(payload));
+
+    memcpy(trailer.checksum, SHA256(psp_packet, sizeof(psp_packet), NULL), sizeof(trailer.checksum));
+
+    memcpy(dst + sizeof(header) + sizeof(payload), &trailer, sizeof(trailer));
+
+    return sizeof(dst);
+}
+
+
+ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, uint32_t){
+    struct psphdr header;
+    memcpy(&header, src, sizeof(header));
+
+    unsigned char payload[sizeof(src) - sizeof(header) - sizeof(struct psptrail)];
+    memcpy(payload, src + sizeof(header), sizeof(payload));
+
+    struct psptrail trailer;
+    memcpy(&trailer, src + sizeof(header) + sizeof(payload), sizeof(trailer));
+
+    unsigned char *psp_packet[sizeof(payload) + sizeof(struct psphdr) + sizeof(struct psptrail)];
     memcpy(psp_packet, &header, sizeof(header));
     memcpy(psp_packet + sizeof(header), payload, sizeof(payload));
 
-    trailer.checksum = SHA256(psp_packet, sizeof(psp_packet), NULL);
+    if(memcmp(trailer.checksum, SHA256(psp_packet, sizeof(psp_packet), NULL), sizeof(trailer.checksum)) != 0){
+        return -1;
+    }
 
-    memcpy(psp_packet + sizeof(header) + sizeof(payload), &trailer, sizeof(trailer));
+    AES_KEY key[32];
 
+    unsigned char iv[64];
+    memcpy(iv, header.iv, sizeof(iv));
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+
+    EVP_DecryptInit(ctx, EVP_aes_256_cbc(), key, iv);
+
+    EVP_DecryptUpdate(ctx, dst, sizeof(dst), payload, sizeof(payload));
+
+    EVP_DecryptFinal(ctx, dst, sizeof(dst));
+
+    EVP_CIPHER_CTX_free(ctx);
+
+    return sizeof(dst);
 
 }
 
-struct stream_key {
-    uint64_t stream_id;
-    unsigned char key[32]
-};
-
-struct stream_key key_pairs[50];
 
 struct psphdr {
     uint8_t next_header;
