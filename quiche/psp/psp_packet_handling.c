@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include <quiche.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>
@@ -9,13 +10,45 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <sqlite3.h>
 
-//TODO: Add database for SPIs and keys
-//TODO: Add function to generate SPIs
 //TODO: Add connection to database to record PSP packets
 //TODO: Add comments
 
-ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket, uint16_t src_port, uint32_t spi){
+ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket, uint16_t src_port, uint64_t stream_id){
+    sqlite3 *db;
+    
+    if (!sqlite3_open("/Users/dermottboylan/Desktop/Project/DermottsEyesOnly.db", &db)){
+        fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+
+    char *sql;
+    sqlite3_stmt *stmt;
+
+    sql = "SELECT SPI, ENC_KEY FROM SECURITY_ASSOCIATIONS WHERE STREAM = ?";
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK){
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+
+    if(sqlite3_bind_int(stmt, 1, stream_id) != SQLITE_OK){
+        fprintf(stderr, "Failed to bind parameter: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+
+    uint32_t spi;
+    unsigned char key[32];
+
+    if(sqlite3_step(stmt) == SQLITE_ROW){
+        uint32_t spi = sqlite3_column_int(stmt, 0);
+        memcpy(key, sqlite3_column_text(stmt, 1), sizeof(key));
+    } else {
+        fprintf(stderr, "No SPI or encryption key found for stream: %lu\n", stream_id);
+        return -1;
+    }
+
     struct udphdr inner_header;
     inner_header.uh_dport = socket.sin_port;
     inner_header.uh_sport = htons(src_port);
@@ -27,7 +60,11 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
     memcpy(combined + sizeof(inner_header), src, sizeof(src));
 
 
-    AES_KEY key[32];
+    AES_KEY aes_key[32];
+    if(AES_set_encrypt_key(key, 256, aes_key) != 0){
+        fprintf(stderr, "Failed to set AES key\n");
+        return -1;
+    }
 
     unsigned char payload[sizeof(combined)];
 
@@ -37,7 +74,7 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
 
-    EVP_EncryptInit(ctx, EVP_aes_256_cbc(), key, iv);
+    EVP_EncryptInit(ctx, EVP_aes_256_gcm(), key, iv);
 
     EVP_EncryptUpdate(ctx, payload, sizeof(payload), combined, sizeof(combined));
 
