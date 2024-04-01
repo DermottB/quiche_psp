@@ -10,6 +10,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <openssl/cmac.h>
 #include <sqlite3.h>
 
 //TODO: Add connection to database to record PSP packets
@@ -108,7 +109,7 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
 }
 
 
-ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, uint32_t){
+ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, uint64_t stream){
     struct psphdr header;
     memcpy(&header, src, sizeof(header));
 
@@ -145,6 +146,85 @@ ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, uint32_t){
 
 }
 
+AES_KEY *psp_key_derivation(uint32_t spi){
+    // Get the first bit of the SPI
+    unsigned char spi_bit = spi & 0x80000000;
+
+    sqlite3 *db;
+
+    if (!sqlite3_open("/Users/dermottboylan/Desktop/Project/DermottsEyesOnly.db", &db)){
+        fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+        return NULL;
+    }
+
+    char *sql;
+    sqlite3_stmt *stmt;
+
+    sql = "SELECT KEY FROM MASTER_KEYS WHERE ACTIVE = ?";
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK){
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        return NULL;
+    }
+
+    if(sqlite3_bind_int(stmt, 1, spi_bit) != SQLITE_OK){
+        fprintf(stderr, "Failed to bind parameter: %s\n", sqlite3_errmsg(db));
+        return NULL;
+    }
+
+    unsigned char master_key[32];
+
+    if(sqlite3_step(stmt) == SQLITE_ROW){
+        memcpy(master_key, sqlite3_column_text(stmt, 0), sizeof(master_key));
+    } else {
+        fprintf(stderr, "No active master key found\n");
+        return NULL;
+    }
+
+    __uint128_t hex_bytes_one = ((__uint128_t) counter_one << 96) | ((__uint128_t) label << 64) | ((__uint128_t) spi << 32) | ((__uint128_t) length);
+    __uint128_t hex_bytes_two = ((__uint128_t) counter_two << 96) | ((__uint128_t) label << 64) | ((__uint128_t) spi << 32) | ((__uint128_t) length);
+
+    CMAC_CTX *ctx = CMAC_CTX_new();
+    if(!ctx){
+        fprintf(stderr, "Failed to create CMAC context\n");
+        return NULL;
+    }
+
+    if(CMAC_Init(ctx, master_key, sizeof(master_key), EVP_aes_256_cbc(), NULL) != 1){
+        fprintf(stderr, "Failed to initialise CMAC context\n");
+        return NULL;
+    }
+
+    if(CMAC_Update(ctx, &master_key, sizeof(master_key)) != 1){
+        fprintf(stderr, "Failed to update CMAC context\n");
+        return NULL;
+    }
+
+    unsigned char cmac_one[16];
+    unsigned char cmac_two[16];
+
+    if(CMAC_Final(ctx, *cmac_one, NULL) != 1){
+        fprintf(stderr, "Failed to finalise CMAC context\n");
+        return NULL;
+    }
+
+    if(CMAC_Final(ctx, *cmac_two, NULL) != 1){
+        fprintf(stderr, "Failed to finalise CMAC context\n");
+        return NULL;
+    }
+
+    unsigned char spi_key[32];
+    memcpy(spi_key, cmac_one, sizeof(cmac_one));
+    memcpy(spi_key + sizeof(cmac_one), cmac_two, sizeof(cmac_two));
+
+
+    AES_KEY aes_key[32];
+    if(AES_set_encrypt_key(spi_key, 256, aes_key) != 0){
+        fprintf(stderr, "Failed to set AES key\n");
+        return NULL;
+    }
+}
+
 
 struct psphdr {
     uint8_t next_header;
@@ -162,3 +242,8 @@ struct psphdr {
 struct psptrail {
     __uint128_t checksum;
 };
+
+uint32_t counter_one = 0x00000001;
+uint32_t counter_two = 0x00000002;
+uint32_t label = 0x50763000;
+uint32_t length = 0x00000100;
