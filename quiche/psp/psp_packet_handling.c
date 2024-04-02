@@ -17,6 +17,7 @@
 //TODO: Add comments
 
 ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket, uint16_t src_port, uint64_t stream_id){
+    // Open the database
     sqlite3 *db;
     
     if (!sqlite3_open("/Users/dermottboylan/Desktop/Project/DermottsEyesOnly.db", &db)){
@@ -27,6 +28,7 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
     char *sql;
     sqlite3_stmt *stmt;
 
+    // Get the SPI and encryption key for the stream
     sql = "SELECT SPI, ENC_KEY FROM SECURITY_ASSOCIATIONS WHERE STREAM = ?";
 
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK){
@@ -50,12 +52,16 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
         return -1;
     }
 
+    sqlite3_finalize(stmt);
+
+    // Create the inner header
     struct udphdr inner_header;
     inner_header.uh_dport = socket.sin_port;
     inner_header.uh_sport = htons(src_port);
     inner_header.uh_ulen = sizeof(inner_header) + sizeof(src);
 
 
+    // Combine the inner header and the payload
     unsigned char combined[sizeof(inner_header) + sizeof(src)];
     memcpy(combined, &inner_header, sizeof(inner_header));
     memcpy(combined + sizeof(inner_header), src, sizeof(src));
@@ -69,43 +75,127 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
 
     unsigned char payload[sizeof(combined)];
 
-    unsigned char iv[64];
+    unsigned char iv[8];
 
-    RAND_bytes(iv, 64);
+    RAND_bytes(iv, 8);
+
+    unsigned char iv_spi[sizeof(iv) + sizeof(spi)];
+    memcpy(iv_spi, iv, sizeof(iv));
+    memcpy(iv_spi + sizeof(iv), &spi, sizeof(spi));
+
+    unsigned char tag[16];
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
 
-    EVP_EncryptInit(ctx, EVP_aes_256_gcm(), key, iv);
+    if(!ctx){
+        fprintf(stderr, "Failed to create EVP context\n");
+        goto enc_error;
+    }
 
-    EVP_EncryptUpdate(ctx, payload, sizeof(payload), combined, sizeof(combined));
+    if(EVP_EncryptInit(ctx, EVP_aes_256_gcm(), aes_key, iv_spi) != 1){
+        fprintf(stderr, "Failed to initialise EVP context\n");
+        return -1;
+    }
 
-    EVP_EncryptFinal(ctx, payload, sizeof(payload));
+    if(EVP_EncryptUpdate(ctx, payload, sizeof(payload), combined, sizeof(combined)) != 1){
+        fprintf(stderr, "Failed to update EVP context\n");
+        return -1;
+    }
+
+    if(EVP_EncryptFinal(ctx, payload, sizeof(payload)) != 1){
+        fprintf(stderr, "Failed to finalise EVP context\n");
+        return -1;
+    }
+
+    if(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1){
+        fprintf(stderr, "Failed to get tag\n");
+        return -1;
+    }
 
     EVP_CIPHER_CTX_free(ctx);
 
     struct psphdr header;
 
-    header.next_header = 17;
-    header.reserved = 0;
-    header.offset = 0;
-    header.sample = 0;
-    header.drop = 0;
-    header.version = 1;
-    header.virtual = 0;
+    header.next_header = 0x0011;
+    header.hdr_ext_len = 0x0000;
+    header.reserved = 0x0;
+    header.offset = 0x0;
+    header.sample = 0x0;
+    header.drop = 0x0;
+    header.version = 0x1;
+    header.virtual = 0x0;
+    header.padding = 0x1;
+    header.spi = spi;
     header.iv = iv;
 
+    uint8_t psp_header[16] = {0};
+
+    psp_header[0] = header.next_header;
+    psp_header[1] = header.hdr_ext_len;
+    psp_header[2] = header.reserved << 6 | header.offset;
+    psp_header[3] = header.sample << 7 | header.drop << 6 | header.version << 4 | header.virtual << 1 | header.padding;
+    psp_header[4] = header.spi >> 24;
+    psp_header[5] = header.spi >> 16;
+    psp_header[6] = header.spi >> 8;
+    psp_header[7] = header.spi;
+    psp_header[8] = header.iv >> 56;
+    psp_header[9] = header.iv >> 48;
+    psp_header[10] = header.iv >> 40;
+    psp_header[11] = header.iv >> 32;
+    psp_header[12] = header.iv >> 24;
+    psp_header[13] = header.iv >> 16;
+    psp_header[14] = header.iv >> 8;
+    psp_header[15] = header.iv;
 
     struct psptrail trailer;
 
-    unsigned char *psp_packet[sizeof(payload) + sizeof(struct psphdr) + sizeof(struct psptrail)];
-    memcpy(dst, &header, sizeof(header));
-    memcpy(dst + sizeof(header), payload, sizeof(payload));
+    unsigned char *psp_packet[sizeof(payload) + sizeof(psp_header) + sizeof(struct psptrail)];
+    memcpy(dst, &psp_header, sizeof(psp_header));
+    memcpy(dst + sizeof(psp_header), payload, sizeof(payload));
 
-    memcpy(trailer.checksum, SHA256(psp_packet, sizeof(psp_packet), NULL), sizeof(trailer.checksum));
+    memcpy(trailer.checksum, tag, sizeof(tag));
 
     memcpy(dst + sizeof(header) + sizeof(payload), &trailer, sizeof(trailer));
 
+    sql = "UPDATE SEND_STATS SET PACKETS = PACKETS+1, BYTES = BYTES + ?;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK){
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+
+    if(sqlite3_bind_int(stmt, 1, sizeof(payload)) != SQLITE_OK){
+        fprintf(stderr, "Failed to bind parameter: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+
+    if(sqlite3_step(stmt) != SQLITE_DONE){
+        fprintf(stderr, "Failed to update send stats: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+
     return sizeof(dst);
+
+    enc_error:
+        sql = "UPDATE SEND_STATS SET ERROR_PACKETS = ERROR_PACKETS+1;";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK){
+            fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+            return -1;
+        }
+
+        if(sqlite3_step(stmt) != SQLITE_DONE){
+            fprintf(stderr, "Failed to update send stats: %s\n", sqlite3_errmsg(db));
+            return -1;
+        }
+
+        sqlite3_finalize(stmt);
+
+        sqlite3_close(db);
+
+        return -1;
 }
 
 
@@ -123,18 +213,17 @@ ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, uint64_t stream){
     memcpy(psp_packet, &header, sizeof(header));
     memcpy(psp_packet + sizeof(header), payload, sizeof(payload));
 
-    if(memcmp(trailer.checksum, SHA256(psp_packet, sizeof(psp_packet), NULL), sizeof(trailer.checksum)) != 0){
-        return -1;
-    }
+    AES_KEY key[32] = psp_key_derivation(header.spi);
 
-    AES_KEY key[32];
-
-    unsigned char iv[64];
-    memcpy(iv, header.iv, sizeof(iv));
+    unsigned char iv_spi[sizeof(header.iv) + sizeof(header.spi)];
+    memcpy(iv_spi, header.iv, sizeof(header.iv));
+    memcpy(iv_spi + sizeof(header.iv), &header.spi, sizeof(header.spi));
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
 
-    EVP_DecryptInit(ctx, EVP_aes_256_cbc(), key, iv);
+    EVP_DecryptInit(ctx, EVP_aes_256_gcm(), key, iv_spi);
+
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, trailer.checksum);
 
     EVP_DecryptUpdate(ctx, dst, sizeof(dst), payload, sizeof(payload));
 
@@ -160,7 +249,7 @@ AES_KEY *psp_key_derivation(uint32_t spi){
     char *sql;
     sqlite3_stmt *stmt;
 
-    sql = "SELECT KEY FROM MASTER_KEYS WHERE ACTIVE = ?";
+    sql = "SELECT KEY FROM MASTER_KEYS WHERE KEY_NUMBER = ?";
 
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK){
         fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
@@ -213,6 +302,8 @@ AES_KEY *psp_key_derivation(uint32_t spi){
         return NULL;
     }
 
+    CMAC_CTX_free(ctx);
+
     unsigned char spi_key[32];
     memcpy(spi_key, cmac_one, sizeof(cmac_one));
     memcpy(spi_key + sizeof(cmac_one), cmac_two, sizeof(cmac_two));
@@ -223,6 +314,7 @@ AES_KEY *psp_key_derivation(uint32_t spi){
         fprintf(stderr, "Failed to set AES key\n");
         return NULL;
     }
+    return aes_key;
 }
 
 
@@ -235,6 +327,7 @@ struct psphdr {
     unsigned drop: 1;
     unsigned version: 4;
     unsigned virtual: 1;
+    unsigned padding: 1;
     uint32_t spi;
     uint64_t iv;
 };
