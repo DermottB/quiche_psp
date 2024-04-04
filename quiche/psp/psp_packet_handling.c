@@ -13,14 +13,111 @@
 #include <openssl/cmac.h>
 #include <sqlite3.h>
 
-//TODO: Add connection to database to record PSP packets
 //TODO: Add comments
+
+
+struct psphdr {
+    uint8_t next_header;
+    uint8_t hdr_ext_len;
+    unsigned reserved: 2;
+    unsigned offset: 6;
+    unsigned sample: 1;
+    unsigned drop: 1;
+    unsigned version: 4;
+    unsigned virtual: 1;
+    unsigned padding: 1;
+    uint32_t spi;
+    uint64_t iv;
+};
+
+uint32_t counter_one = 0x00000001;
+uint32_t counter_two = 0x00000002;
+uint32_t label = 0x50763000;
+uint32_t length = 0x00000100;
+
+unsigned char *psp_key_derivation(uint32_t spi){
+    // Get the first bit of the SPI
+    unsigned char spi_bit = spi & 0x80000000;
+
+    sqlite3 *db;
+
+    if (!sqlite3_open("/vagrant/DermottsEyesOnly.db", &db)){
+        fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+        return NULL;
+    }
+
+    char *sql;
+    sqlite3_stmt *stmt;
+
+    sql = "SELECT KEY FROM MASTER_KEYS WHERE KEY_NUMBER = ?";
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK){
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        return NULL;
+    }
+
+    if(sqlite3_bind_int(stmt, 1, spi_bit) != SQLITE_OK){
+        fprintf(stderr, "Failed to bind parameter: %s\n", sqlite3_errmsg(db));
+        return NULL;
+    }
+
+    unsigned char master_key[32];
+
+    if(sqlite3_step(stmt) == SQLITE_ROW){
+        memcpy(master_key, sqlite3_column_text(stmt, 0), sizeof(master_key));
+    } else {
+        fprintf(stderr, "No active master key found\n");
+        return NULL;
+    }
+
+    __uint128_t hex_bytes_one = ((__uint128_t) counter_one << 96) | ((__uint128_t) label << 64) | ((__uint128_t) spi << 32) | ((__uint128_t) length);
+    __uint128_t hex_bytes_two = ((__uint128_t) counter_two << 96) | ((__uint128_t) label << 64) | ((__uint128_t) spi << 32) | ((__uint128_t) length);
+
+    EVP_MAC *mac = EVP_MAC_fetch(NULL, "CMAC", NULL);
+    
+    EVP_MAC_CTX *ctx = EVP_MAC_CTX_new(mac);
+    if(!ctx){
+        fprintf(stderr, "Failed to create CMAC context\n");
+        return NULL;
+    }
+
+    if(EVP_MAC_init(ctx, master_key, sizeof(master_key), EVP_aes_256_cbc()) != 1){
+        fprintf(stderr, "Failed to initialise CMAC context\n");
+        return NULL;
+    }
+
+    if(EVP_MAC_update(ctx, &master_key, sizeof(master_key)) != 1){
+        fprintf(stderr, "Failed to update CMAC context\n");
+        return NULL;
+    }
+    unsigned char cmac_one[16];
+    unsigned char cmac_two[16];
+
+    if(EVP_MAC_final(ctx, cmac_one, NULL, sizeof(cmac_one)) != 1){
+        fprintf(stderr, "Failed to finalise CMAC context\n");
+        return NULL;
+    }
+
+    if(EVP_MAC_final(ctx, cmac_two, NULL, sizeof(cmac_two)) != 1){
+        fprintf(stderr, "Failed to finalise CMAC context\n");
+        return NULL;
+    }
+
+    EVP_MAC_free(ctx);
+
+    unsigned char spi_key[32];
+    memcpy(spi_key, cmac_one, sizeof(cmac_one));
+    memcpy(spi_key + sizeof(cmac_one), cmac_two, sizeof(cmac_two));
+
+    sqlite3_close(db);
+    return spi_key;
+}
 
 ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket, uint16_t src_port, uint64_t stream_id){
     // Open the database
     sqlite3 *db;
     
-    if (!sqlite3_open("/Users/dermottboylan/Desktop/Project/DermottsEyesOnly.db", &db)){
+    if (!sqlite3_open("/vagrant/DermottsEyesOnly.db", &db)){
         fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
         return -1;
     }
@@ -48,7 +145,7 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
         uint32_t spi = sqlite3_column_int(stmt, 0);
         memcpy(key, sqlite3_column_text(stmt, 1), sizeof(key));
     } else {
-        fprintf(stderr, "No SPI or encryption key found for stream: %lu\n", stream_id);
+        fprintf(stderr, "No SPI or encryption key found for stream: %llu\n", stream_id);
         return -1;
     }
 
@@ -62,18 +159,9 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
 
 
     // Combine the inner header and the payload
-    unsigned char combined[sizeof(inner_header) + sizeof(src)];
-    memcpy(combined, &inner_header, sizeof(inner_header));
-    memcpy(combined + sizeof(inner_header), src, sizeof(src));
-
-
-    AES_KEY aes_key[32];
-    if(AES_set_encrypt_key(key, 256, aes_key) != 0){
-        fprintf(stderr, "Failed to set AES key\n");
-        return -1;
-    }
-
-    unsigned char payload[sizeof(combined)];
+    unsigned char payload[sizeof(inner_header) + sizeof(src)];
+    memcpy(payload, &inner_header, sizeof(inner_header));
+    memcpy(payload + sizeof(inner_header), src, sizeof(*src));
 
     unsigned char iv[8];
 
@@ -92,17 +180,17 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
         goto enc_error;
     }
 
-    if(EVP_EncryptInit(ctx, EVP_aes_256_gcm(), aes_key, iv_spi) != 1){
+    if(EVP_EncryptInit(ctx, EVP_aes_256_gcm(), key, iv_spi) != 1){
         fprintf(stderr, "Failed to initialise EVP context\n");
         return -1;
     }
 
-    if(EVP_EncryptUpdate(ctx, payload, sizeof(payload), combined, sizeof(combined)) != 1){
+    if(EVP_EncryptUpdate(ctx, payload, (int *) sizeof(&payload), payload, sizeof(payload)) != 1){
         fprintf(stderr, "Failed to update EVP context\n");
         return -1;
     }
 
-    if(EVP_EncryptFinal(ctx, payload, sizeof(payload)) != 1){
+    if(EVP_EncryptFinal(ctx, payload, (int *) sizeof(&payload)) != 1){
         fprintf(stderr, "Failed to finalise EVP context\n");
         return -1;
     }
@@ -147,15 +235,10 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
     psp_header[14] = header.iv >> 8;
     psp_header[15] = header.iv;
 
-    struct psptrail trailer;
-
-    unsigned char *psp_packet[sizeof(payload) + sizeof(psp_header) + sizeof(struct psptrail)];
+    unsigned char *psp_packet[sizeof(payload) + sizeof(psp_header) + sizeof(tag)];
     memcpy(dst, &psp_header, sizeof(psp_header));
     memcpy(dst + sizeof(psp_header), payload, sizeof(payload));
-
-    memcpy(trailer.checksum, tag, sizeof(tag));
-
-    memcpy(dst + sizeof(header) + sizeof(payload), &trailer, sizeof(trailer));
+    memcpy(dst + sizeof(psp_header) + sizeof(payload), tag, sizeof(tag));
 
     sql = "UPDATE SEND_STATS SET PACKETS = PACKETS+1, BYTES = BYTES + ?;";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK){
@@ -203,17 +286,17 @@ ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, uint64_t stream){
     struct psphdr header;
     memcpy(&header, src, sizeof(header));
 
-    unsigned char payload[sizeof(src) - sizeof(header) - sizeof(struct psptrail)];
+    unsigned char payload[sizeof(src) - sizeof(header) - 16];
     memcpy(payload, src + sizeof(header), sizeof(payload));
 
-    struct psptrail trailer;
-    memcpy(&trailer, src + sizeof(header) + sizeof(payload), sizeof(trailer));
+    unsigned char tag[16];
+    memcpy(&tag, src + sizeof(header) + sizeof(payload), sizeof(tag));
 
-    unsigned char *psp_packet[sizeof(payload) + sizeof(struct psphdr) + sizeof(struct psptrail)];
+    unsigned char *psp_packet[sizeof(payload) + sizeof(struct psphdr) + 16];
     memcpy(psp_packet, &header, sizeof(header));
     memcpy(psp_packet + sizeof(header), payload, sizeof(payload));
 
-    AES_KEY key[32] = psp_key_derivation(header.spi);
+    unsigned char key[32] = psp_key_derivation(header.spi);
 
     unsigned char iv_spi[sizeof(header.iv) + sizeof(header.spi)];
     memcpy(iv_spi, header.iv, sizeof(header.iv));
@@ -223,7 +306,7 @@ ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, uint64_t stream){
 
     EVP_DecryptInit(ctx, EVP_aes_256_gcm(), key, iv_spi);
 
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, trailer.checksum);
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag);
 
     EVP_DecryptUpdate(ctx, dst, sizeof(dst), payload, sizeof(payload));
 
@@ -234,109 +317,3 @@ ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, uint64_t stream){
     return sizeof(dst);
 
 }
-
-AES_KEY *psp_key_derivation(uint32_t spi){
-    // Get the first bit of the SPI
-    unsigned char spi_bit = spi & 0x80000000;
-
-    sqlite3 *db;
-
-    if (!sqlite3_open("/Users/dermottboylan/Desktop/Project/DermottsEyesOnly.db", &db)){
-        fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
-        return NULL;
-    }
-
-    char *sql;
-    sqlite3_stmt *stmt;
-
-    sql = "SELECT KEY FROM MASTER_KEYS WHERE KEY_NUMBER = ?";
-
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK){
-        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
-        return NULL;
-    }
-
-    if(sqlite3_bind_int(stmt, 1, spi_bit) != SQLITE_OK){
-        fprintf(stderr, "Failed to bind parameter: %s\n", sqlite3_errmsg(db));
-        return NULL;
-    }
-
-    unsigned char master_key[32];
-
-    if(sqlite3_step(stmt) == SQLITE_ROW){
-        memcpy(master_key, sqlite3_column_text(stmt, 0), sizeof(master_key));
-    } else {
-        fprintf(stderr, "No active master key found\n");
-        return NULL;
-    }
-
-    __uint128_t hex_bytes_one = ((__uint128_t) counter_one << 96) | ((__uint128_t) label << 64) | ((__uint128_t) spi << 32) | ((__uint128_t) length);
-    __uint128_t hex_bytes_two = ((__uint128_t) counter_two << 96) | ((__uint128_t) label << 64) | ((__uint128_t) spi << 32) | ((__uint128_t) length);
-
-    CMAC_CTX *ctx = CMAC_CTX_new();
-    if(!ctx){
-        fprintf(stderr, "Failed to create CMAC context\n");
-        return NULL;
-    }
-
-    if(CMAC_Init(ctx, master_key, sizeof(master_key), EVP_aes_256_cbc(), NULL) != 1){
-        fprintf(stderr, "Failed to initialise CMAC context\n");
-        return NULL;
-    }
-
-    if(CMAC_Update(ctx, &master_key, sizeof(master_key)) != 1){
-        fprintf(stderr, "Failed to update CMAC context\n");
-        return NULL;
-    }
-
-    unsigned char cmac_one[16];
-    unsigned char cmac_two[16];
-
-    if(CMAC_Final(ctx, *cmac_one, NULL) != 1){
-        fprintf(stderr, "Failed to finalise CMAC context\n");
-        return NULL;
-    }
-
-    if(CMAC_Final(ctx, *cmac_two, NULL) != 1){
-        fprintf(stderr, "Failed to finalise CMAC context\n");
-        return NULL;
-    }
-
-    CMAC_CTX_free(ctx);
-
-    unsigned char spi_key[32];
-    memcpy(spi_key, cmac_one, sizeof(cmac_one));
-    memcpy(spi_key + sizeof(cmac_one), cmac_two, sizeof(cmac_two));
-
-
-    AES_KEY aes_key[32];
-    if(AES_set_encrypt_key(spi_key, 256, aes_key) != 0){
-        fprintf(stderr, "Failed to set AES key\n");
-        return NULL;
-    }
-    return aes_key;
-}
-
-
-struct psphdr {
-    uint8_t next_header;
-    uint8_t hdr_ext_len;
-    unsigned reserved: 2;
-    unsigned offset: 6;
-    unsigned sample: 1;
-    unsigned drop: 1;
-    unsigned version: 4;
-    unsigned virtual: 1;
-    unsigned padding: 1;
-    uint32_t spi;
-    uint64_t iv;
-};
-
-struct psptrail {
-    __uint128_t checksum;
-};
-
-uint32_t counter_one = 0x00000001;
-uint32_t counter_two = 0x00000002;
-uint32_t label = 0x50763000;
-uint32_t length = 0x00000100;
