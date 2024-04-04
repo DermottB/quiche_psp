@@ -296,11 +296,11 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
 }
 
 
-ssize_t quiche_decrypt_psp(unsigned char *dst, unsigned char *src, uint64_t stream){
+ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, int srclen, uint64_t stream){
     struct psphdr header;
     memcpy(&header, src, sizeof(header));
 
-    unsigned char payload[sizeof(src) - sizeof(header) - 16];
+    unsigned char payload[srclen - 32];
     memcpy(payload, src + sizeof(header), sizeof(payload));
 
     unsigned char tag[16];
@@ -311,10 +311,10 @@ ssize_t quiche_decrypt_psp(unsigned char *dst, unsigned char *src, uint64_t stre
     memcpy(psp_packet + sizeof(header), payload, sizeof(payload));
 
     unsigned char key[32]; 
-    psp_key_derivation(*key, header.spi);
+    psp_key_derivation(key, header.spi);
 
     unsigned char iv_spi[sizeof(header.iv) + sizeof(header.spi)];
-    memcpy(iv_spi, header.iv, sizeof(header.iv));
+    memcpy(iv_spi, &header.iv, sizeof(header.iv));
     memcpy(iv_spi + sizeof(header.iv), &header.spi, sizeof(header.spi));
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
@@ -323,9 +323,9 @@ ssize_t quiche_decrypt_psp(unsigned char *dst, unsigned char *src, uint64_t stre
 
     EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag);
 
-    EVP_DecryptUpdate(ctx, dst, sizeof(dst), payload, sizeof(payload));
+    EVP_DecryptUpdate(ctx, dst, (int *) srclen - 32, payload, sizeof(payload));
 
-    EVP_DecryptFinal(ctx, dst, sizeof(dst));
+    EVP_DecryptFinal(ctx, dst, (int *) sizeof(dst));
 
     EVP_CIPHER_CTX_free(ctx);
 
