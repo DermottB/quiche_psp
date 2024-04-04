@@ -11,6 +11,8 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/cmac.h>
+#include <openssl/params.h>
+#include <openssl/core_names.h>
 #include <sqlite3.h>
 
 //TODO: Add comments
@@ -35,7 +37,7 @@ uint32_t counter_two = 0x00000002;
 uint32_t label = 0x50763000;
 uint32_t length = 0x00000100;
 
-unsigned char *psp_key_derivation(uint32_t spi){
+unsigned char *psp_key_derivation(unsigned char *buf, uint32_t spi){
     // Get the first bit of the SPI
     unsigned char spi_bit = spi & 0x80000000;
 
@@ -73,7 +75,13 @@ unsigned char *psp_key_derivation(uint32_t spi){
     __uint128_t hex_bytes_one = ((__uint128_t) counter_one << 96) | ((__uint128_t) label << 64) | ((__uint128_t) spi << 32) | ((__uint128_t) length);
     __uint128_t hex_bytes_two = ((__uint128_t) counter_two << 96) | ((__uint128_t) label << 64) | ((__uint128_t) spi << 32) | ((__uint128_t) length);
 
-    EVP_MAC *mac = EVP_MAC_fetch(NULL, "CMAC", NULL);
+    OSSL_LIB_CTX *libctx = OSSL_LIB_CTX_new();
+    if(!libctx){
+        fprintf(stderr, "Failed to create libctx\n");
+        return NULL;
+    }
+    
+    EVP_MAC *mac = EVP_MAC_fetch(libctx, "CMAC", NULL);
     
     EVP_MAC_CTX *ctx = EVP_MAC_CTX_new(mac);
     if(!ctx){
@@ -81,12 +89,18 @@ unsigned char *psp_key_derivation(uint32_t spi){
         return NULL;
     }
 
-    if(EVP_MAC_init(ctx, master_key, sizeof(master_key), EVP_aes_256_cbc()) != 1){
+    OSSL_PARAM params[4], * p = params;
+    char cipher_name[] = "AES-128-CBC";
+
+    *p++ = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER, cipher_name, sizeof(cipher_name));
+    *p = OSSL_PARAM_construct_end(); 
+
+    if(EVP_MAC_init(ctx, master_key, sizeof(master_key), params) != 1){
         fprintf(stderr, "Failed to initialise CMAC context\n");
         return NULL;
     }
 
-    if(EVP_MAC_update(ctx, &master_key, sizeof(master_key)) != 1){
+    if(EVP_MAC_update(ctx, master_key, sizeof(master_key)) != 1){
         fprintf(stderr, "Failed to update CMAC context\n");
         return NULL;
     }
@@ -103,14 +117,14 @@ unsigned char *psp_key_derivation(uint32_t spi){
         return NULL;
     }
 
-    EVP_MAC_free(ctx);
+    EVP_MAC_CTX_free(ctx);
+    EVP_MAC_free(mac);
 
-    unsigned char spi_key[32];
-    memcpy(spi_key, cmac_one, sizeof(cmac_one));
-    memcpy(spi_key + sizeof(cmac_one), cmac_two, sizeof(cmac_two));
+    memcpy(buf, cmac_one, sizeof(cmac_one));
+    memcpy(buf + sizeof(cmac_one), cmac_two, sizeof(cmac_two));
 
     sqlite3_close(db);
-    return spi_key;
+    return buf;
 }
 
 ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket, uint16_t src_port, uint64_t stream_id){
@@ -214,7 +228,7 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
     header.virtual = 0x0;
     header.padding = 0x1;
     header.spi = spi;
-    header.iv = iv;
+    header.iv = (uint64_t) iv;
 
     uint8_t psp_header[16] = {0};
 
@@ -282,7 +296,7 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
 }
 
 
-ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, uint64_t stream){
+ssize_t quiche_decrypt_psp(unsigned char *dst, unsigned char *src, uint64_t stream){
     struct psphdr header;
     memcpy(&header, src, sizeof(header));
 
@@ -296,7 +310,8 @@ ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, uint64_t stream){
     memcpy(psp_packet, &header, sizeof(header));
     memcpy(psp_packet + sizeof(header), payload, sizeof(payload));
 
-    unsigned char key[32] = psp_key_derivation(header.spi);
+    unsigned char key[32]; 
+    psp_key_derivation(*key, header.spi);
 
     unsigned char iv_spi[sizeof(header.iv) + sizeof(header.spi)];
     memcpy(iv_spi, header.iv, sizeof(header.iv));
