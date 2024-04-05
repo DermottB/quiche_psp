@@ -10,7 +10,11 @@
                 "${file}",
                 "-o",
                 "${fileDirname}/${fileBasenameNoExtension}",
-                "$-lcrypto$"
+                "-I/usr/local/opt/openssl/include",
+                "-L/usr/local/opt/openssl/lib",
+                "-lssl",
+                "-lcrypto",
+                "-lsqlite3"
             ],
             "options": {
                 "cwd": "${fileDirname}"

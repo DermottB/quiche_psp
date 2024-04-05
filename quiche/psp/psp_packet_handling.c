@@ -15,9 +15,7 @@
 #include <openssl/core_names.h>
 #include <sqlite3.h>
 
-//TODO: Fix sizes of input buffers
 //TODO: Add comments
-
 
 struct psphdr {
     uint8_t next_header;
@@ -186,7 +184,12 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, size_t pkt_len, struct so
     memcpy(iv_spi, iv, sizeof(iv));
     memcpy(iv_spi + sizeof(iv), &spi, sizeof(spi));
 
+    struct psphdr header;
+    uint8_t psp_header[16] = {0};
+
     unsigned char tag[16];
+
+    unsigned char *psp_packet[sizeof(payload) + sizeof(psp_header) + sizeof(tag)];
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
 
@@ -217,8 +220,6 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, size_t pkt_len, struct so
 
     EVP_CIPHER_CTX_free(ctx);
 
-    struct psphdr header;
-
     header.next_header = 0x0011;
     header.hdr_ext_len = 0x0000;
     header.reserved = 0x0;
@@ -230,8 +231,6 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, size_t pkt_len, struct so
     header.padding = 0x1;
     header.spi = spi;
     header.iv = (uint64_t) iv;
-
-    uint8_t psp_header[16] = {0};
 
     psp_header[0] = header.next_header;
     psp_header[1] = header.hdr_ext_len;
@@ -250,7 +249,6 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, size_t pkt_len, struct so
     psp_header[14] = header.iv >> 8;
     psp_header[15] = header.iv;
 
-    unsigned char *psp_packet[sizeof(payload) + sizeof(psp_header) + sizeof(tag)];
     memcpy(dst, &psp_header, sizeof(psp_header));
     memcpy(dst + sizeof(psp_header), payload, sizeof(payload));
     memcpy(dst + sizeof(psp_header) + sizeof(payload), tag, sizeof(tag));
@@ -312,14 +310,18 @@ ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, size_t pkt_len, uint64_t 
     memcpy(iv_spi, &header.iv, sizeof(header.iv));
     memcpy(iv_spi + sizeof(header.iv), &header.spi, sizeof(header.spi));
 
+    int dec_len = pkt_len - 32;
+    int *p = &dec_len;
+
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
 
     EVP_DecryptInit(ctx, EVP_aes_256_gcm(), key, iv_spi);
 
     EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag);
-    EVP_DecryptUpdate(ctx, dst, pkt_len - 32, payload, sizeof(payload));
 
-    EVP_DecryptFinal(ctx, dst, sizeof(dst));
+    EVP_DecryptUpdate(ctx, dst, p, payload, sizeof(payload));
+
+    EVP_DecryptFinal(ctx, dst, p);
 
     EVP_CIPHER_CTX_free(ctx);
 
