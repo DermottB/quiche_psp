@@ -15,6 +15,7 @@
 #include <openssl/core_names.h>
 #include <sqlite3.h>
 
+//TODO: Fix sizes of input buffers
 //TODO: Add comments
 
 
@@ -127,7 +128,7 @@ unsigned char *psp_key_derivation(unsigned char *buf, uint32_t spi){
     return buf;
 }
 
-ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket, uint16_t src_port, uint64_t stream_id){
+ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, size_t pkt_len, struct sockaddr_in socket, uint16_t src_port, uint64_t stream_id){
     // Open the database
     sqlite3 *db;
     
@@ -169,13 +170,13 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
     struct udphdr inner_header;
     inner_header.uh_dport = socket.sin_port;
     inner_header.uh_sport = htons(src_port);
-    inner_header.uh_ulen = sizeof(inner_header) + sizeof(src);
+    inner_header.uh_ulen = sizeof(inner_header) + pkt_len;
 
 
     // Combine the inner header and the payload
-    unsigned char payload[sizeof(inner_header) + sizeof(src)];
+    unsigned char payload[sizeof(inner_header) + pkt_len];
     memcpy(payload, &inner_header, sizeof(inner_header));
-    memcpy(payload + sizeof(inner_header), src, sizeof(*src));
+    memcpy(payload + sizeof(inner_header), src, pkt_len);
 
     unsigned char iv[8];
 
@@ -196,22 +197,22 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
 
     if(EVP_EncryptInit(ctx, EVP_aes_256_gcm(), key, iv_spi) != 1){
         fprintf(stderr, "Failed to initialise EVP context\n");
-        return -1;
+        goto enc_error;
     }
 
     if(EVP_EncryptUpdate(ctx, payload, (int *) sizeof(&payload), payload, sizeof(payload)) != 1){
         fprintf(stderr, "Failed to update EVP context\n");
-        return -1;
+        goto enc_error;
     }
 
     if(EVP_EncryptFinal(ctx, payload, (int *) sizeof(&payload)) != 1){
         fprintf(stderr, "Failed to finalise EVP context\n");
-        return -1;
+        goto enc_error;
     }
 
     if(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1){
         fprintf(stderr, "Failed to get tag\n");
-        return -1;
+        goto enc_error;
     }
 
     EVP_CIPHER_CTX_free(ctx);
@@ -280,12 +281,10 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
         sql = "UPDATE SEND_STATS SET ERROR_PACKETS = ERROR_PACKETS+1;";
         if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK){
             fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
-            return -1;
         }
 
         if(sqlite3_step(stmt) != SQLITE_DONE){
             fprintf(stderr, "Failed to update send stats: %s\n", sqlite3_errmsg(db));
-            return -1;
         }
 
         sqlite3_finalize(stmt);
@@ -296,19 +295,15 @@ ssize_t quiche_encrypt_psp(uint8_t *dst, uint8_t *src, struct sockaddr_in socket
 }
 
 
-ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, int srclen, uint64_t stream){
+ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, size_t pkt_len, uint64_t stream){
     struct psphdr header;
     memcpy(&header, src, sizeof(header));
 
-    unsigned char payload[srclen - 32];
+    unsigned char payload[pkt_len - 32];
     memcpy(payload, src + sizeof(header), sizeof(payload));
 
     unsigned char tag[16];
     memcpy(&tag, src + sizeof(header) + sizeof(payload), sizeof(tag));
-
-    unsigned char *psp_packet[sizeof(payload) + sizeof(struct psphdr) + 16];
-    memcpy(psp_packet, &header, sizeof(header));
-    memcpy(psp_packet + sizeof(header), payload, sizeof(payload));
 
     unsigned char key[32]; 
     psp_key_derivation(key, header.spi);
@@ -322,10 +317,9 @@ ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, int srclen, uint64_t stre
     EVP_DecryptInit(ctx, EVP_aes_256_gcm(), key, iv_spi);
 
     EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag);
+    EVP_DecryptUpdate(ctx, dst, pkt_len - 32, payload, sizeof(payload));
 
-    EVP_DecryptUpdate(ctx, dst, (int *) srclen - 32, payload, sizeof(payload));
-
-    EVP_DecryptFinal(ctx, dst, (int *) sizeof(dst));
+    EVP_DecryptFinal(ctx, dst, sizeof(dst));
 
     EVP_CIPHER_CTX_free(ctx);
 
