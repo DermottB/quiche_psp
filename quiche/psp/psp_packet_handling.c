@@ -328,3 +328,7 @@ ssize_t quiche_decrypt_psp(uint8_t *dst, uint8_t *src, size_t pkt_len, uint64_t 
     return sizeof(dst);
 
 }
+
+int main(){
+    return 0;
+}
